@@ -1,0 +1,72 @@
+name: Build zcgo from zip
+
+# В репозитории лежит только архив zcgo*.zip: сценарий сам распаковывает самый свежий, прогоняет тесты
+# и собирает zcgo для Linux (amd64 и arm64). Запуск: при загрузке архива или вручную (Run workflow).
+on:
+  workflow_dispatch:
+  push:
+    paths: ['*.zip', '.github/workflows/build-zcgo-from-zip.yml']
+
+concurrency:
+  group: build-zcgo
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Unpack the archive
+        run: |
+          # Самый свежий zip по дате коммита; имена с пробелами (например "zcgo 4.zip") поддерживаются.
+          ZIP=$(git ls-files '*.zip' | while IFS= read -r f; do printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$f")" "$f"; done | sort -n | tail -n 1 | cut -f2-)
+          if [ -z "$ZIP" ]; then echo "В репозитории нет zip-архива"; exit 1; fi
+          echo "Archive: $ZIP"
+          mkdir tree
+          unzip -q "$ZIP" -d tree
+          # Папка проекта: там, где лежит go.mod (архив может содержать верхнюю папку zcgo/).
+          GOMOD=$(find tree -name go.mod -not -path '*/.git/*' | awk '{print length, $0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+          if [ -z "$GOMOD" ]; then echo "В архиве нет go.mod"; exit 1; fi
+          PROJECT=$(dirname "$GOMOD")
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+          echo "Project: $PROJECT"
+          ls "$PROJECT"
+      - name: Format check and vet
+        working-directory: ${{ env.PROJECT }}
+        run: |
+          test -z "$(gofmt -l ./cmd ./internal)" || { gofmt -l ./cmd ./internal; exit 1; }
+          go vet ./...
+      - name: Tests
+        working-directory: ${{ env.PROJECT }}
+        run: go test -count=1 ./...
+      - name: Build
+        working-directory: ${{ env.PROJECT }}
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "$GITHUB_WORKSPACE/dist/zcgo-linux-$arch" ./cmd/zcgo
+          done
+          cd "$GITHUB_WORKSPACE/dist"
+          for f in zcgo-linux-*; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zcgo-linux
+          path: dist/*
+          if-no-files-found: error
+      - name: Release latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest --title "zcgo (linux build)" --notes "auto build" dist/zcgo-linux-amd64 dist/zcgo-linux-arm64 dist/*.sha256
